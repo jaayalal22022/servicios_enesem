@@ -1,6 +1,7 @@
 """ENESEM Servicios: revisión por Excel con cinco cargas independientes."""
 
 from collections import defaultdict, Counter
+from hashlib import sha256
 
 import pandas as pd
 import streamlit as st
@@ -33,75 +34,117 @@ def table(items: list[dict]) -> pd.DataFrame:
     } for r in items])
 
 
-def picker(items: list[dict], key: str) -> dict:
-    return st.selectbox("Elegir servicio", items, key=key,
-        format_func=lambda r: (f"{r['company_id']} · {r['service_id']} · "
-                               f"{norm(r['source'].get('Descripción del servicio'))[:85]}"))
+CHECKS = {
+    "Formato": "Código de servicio:",
+    "Código Otros": "99999999 se reserva",
+    "CIIU código": "CIIU del código fuera",
+    "CPC código": "CPC fuera",
+    "Par CIIU–CPC": "Combinación CIIU–CPC",
+    "Actividad servicio": "Ninguna actividad de servicio",
+    "División excluida": "Actividad en división no investigada",
+    "CIIU actividad": "CIIU del servicio no coincide",
+}
 
 
-def review_form(item: dict, state: dict, catalog, key: str):
-    source, result = item["source"], item["validation"]
-    st.caption(f"{item['load']} · Empresa {item['company_id']} · id_serv {item['service_id']}")
-    st.write("**Actividades:**",
-             "principal", norm(source.get("ciiu4_actividad_principal")) or "—", "·",
-             "secundaria", norm(source.get("ciiu4_actividad_secundaria")) or "—", "·",
-             "tercera", norm(source.get("ciiu4_tercera_actividad")) or "—")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("CPC original", norm(source.get("Código CPC")))
-    c2.metric("Código vigente", result["code"])
-    c3.metric("Correspondencia con actividad", "Sí" if result["activity_match"] else "No")
-    st.caption(f"CPC4 {result['cpc4'] or '—'} · {result['cpc_name'] or '—'}")
-    if result["exceptions"]:
-        st.info("Actividad de excepción: " + ", ".join(result["exceptions"]))
-    for alert in result["alerts"]:
-        st.warning(alert)
-    if not result["alerts"]:
-        st.success("Sin alertas automáticas.")
-    prefix = f"{key}_{item['company_id']}_{item['service_id']}"
-    with st.form(prefix):
-        code = st.text_input("Código CPC corregido (8 dígitos)", value=item["edited_code"])
-        decision = st.selectbox("Decisión", ["Pendiente", "Aceptado", "Cambio"],
-            index=["Pendiente", "Aceptado", "Cambio"].index(item["decision"])
-            if item["decision"] in ("Pendiente", "Aceptado", "Cambio") else 0)
-        reviewer = st.text_input("Nombre del responsable",
-                                 value=item["reviewer"] or st.session_state.get("my_name", ""))
-        note = st.text_area("Revisar / acción necesaria", value=item["review_note"])
-        a, b = st.columns(2)
-        just_ciiu = a.text_area("Justificación CIIU", value=item["just_ciiu"])
-        just_cpc = b.text_area("Justificación CPC", value=item["just_cpc"])
-        just_match = st.text_area("Justificación de correspondencia", value=item["just_match"])
-        observations = st.text_area("Observaciones", value=item["observations"])
-        review_pc = st.text_input("Revisión PC", value=item["review_pc"])
-        submitted = st.form_submit_button("Guardar en esta sesión", type="primary")
-    if submitted:
-        try:
-            changed = update_review(state, identity(item), {
-                "edited_code": code, "review_note": note, "reviewer": reviewer,
-                "decision": decision, "just_ciiu": just_ciiu, "just_cpc": just_cpc,
-                "just_match": just_match, "observations": observations,
-                "review_pc": review_pc,
-            }, catalog)
-        except ValueError as exc:
-            st.error(str(exc))
-            return
-        if changed:
+def alert_counts(items):
+    return {name: sum(any(a.startswith(prefix) for a in r["validation"]["alerts"])
+                      for r in items) for name, prefix in CHECKS.items()}
+
+
+def summary_row(label, rows):
+    checks = alert_counts(rows)
+    return {"Grupo": label, "Servicios": len(rows),
+            "Revisados": sum(r["decision"] in ("Aceptado", "Cambio") for r in rows),
+            "Con alertas": sum(bool(r["validation"]["alerts"]) for r in rows),
+            "Incumplimientos": sum(len(r["validation"]["alerts"]) for r in rows),
+            **checks}
+
+
+def edit_matrix(items: list[dict], state: dict, catalog, key: str):
+    """Revisa varios servicios en una cuadrícula; los datos del informante son de lectura."""
+    rows = []
+    for r in items:
+        rows.append({
+            "Empresa": r["company_id"], "id_serv": r["service_id"],
+            "Descripción": norm(r["source"].get("Descripción del servicio")),
+            "CPC original": norm(r["source"].get("Código CPC")),
+            "CPC corregido": r["edited_code"], "Alertas": " | ".join(r["validation"]["alerts"]),
+            "Decisión": r["decision"], "Responsable": r["reviewer"],
+            "Revisar": r["review_note"], "Observaciones": r["observations"],
+        })
+    st.caption("Edita las celdas blancas y pulsa Guardar cambios. El CPC original y los datos informados son de lectura.")
+    frame = pd.DataFrame(rows)
+    disabled = ["Empresa", "id_serv", "Descripción", "CPC original", "Alertas"]
+    edited = st.data_editor(frame, key=f"grid_{key}", hide_index=True,
+        use_container_width=True, height=min(560, 88 + 36 * len(rows)),
+        disabled=disabled, num_rows="fixed",
+        column_config={
+            "Decisión": st.column_config.SelectboxColumn(options=["Pendiente", "Aceptado", "Cambio"], required=True),
+            "CPC corregido": st.column_config.TextColumn(help="Código de ocho dígitos, sin modificar el original"),
+            "Descripción": st.column_config.TextColumn(width="large"),
+            "Alertas": st.column_config.TextColumn(width="large"),
+            "Revisar": st.column_config.TextColumn(width="medium"),
+            "Observaciones": st.column_config.TextColumn(width="medium"),
+        })
+    with st.expander("Justificaciones y revisión PC (opcionales)"):
+        extras = pd.DataFrame([{
+            "id_serv": r["service_id"], "Justificación CIIU": r["just_ciiu"],
+            "Justificación CPC": r["just_cpc"],
+            "Justificación correspondencia": r["just_match"],
+            "Revisión PC": r["review_pc"],
+        } for r in items])
+        extra_edit = st.data_editor(extras, key=f"extras_{key}", hide_index=True,
+            use_container_width=True, height=min(420, 88 + 36 * len(rows)),
+            disabled=["id_serv"], num_rows="fixed")
+    if st.button("Guardar cambios de la matriz", key=f"save_{key}", type="primary"):
+        failures, saved = [], 0
+        for idx, item in enumerate(items):
+            main, extra = edited.iloc[idx], extra_edit.iloc[idx]
+            changes = {
+                "edited_code": main["CPC corregido"], "decision": main["Decisión"],
+                "reviewer": main["Responsable"], "review_note": main["Revisar"],
+                "observations": main["Observaciones"],
+                "just_ciiu": extra["Justificación CIIU"], "just_cpc": extra["Justificación CPC"],
+                "just_match": extra["Justificación correspondencia"], "review_pc": extra["Revisión PC"],
+            }
+            if all(norm(value) == norm(item[field]) for field, value in changes.items()):
+                continue
+            changes["reviewer"] = norm(changes["reviewer"]) or st.session_state.get("my_name", "")
+            try:
+                if update_review(state, identity(item), changes, catalog):
+                    saved += 1
+            except ValueError as exc:
+                failures.append(f"id_serv {item['service_id']}: {exc}")
+        if saved:
             st.session_state.pop("download_bytes", None)
-            st.session_state["notice"] = "Revisión guardada en esta sesión. Descarga el Excel para conservarla."
+            st.session_state["preferred_load"] = selected_load
+            st.session_state["preferred_company"] = st.session_state.get(f"company_{st.session_state['generation']}")
+            st.session_state["preferred_cpc"] = st.session_state.get(f"cpc_{st.session_state['generation']}")
+            st.session_state["generation"] += 1
+            st.session_state["notice"] = f"{saved} revisión(es) guardada(s) en esta sesión. Descarga el Excel para conservarlas."
+        if failures:
+            st.session_state["save_errors"] = failures
+        if saved:
             st.rerun()
-        st.info("No hubo cambios en esta revisión.")
+        if not failures:
+            st.info("No hubo cambios para guardar.")
 
 
 st.title("ENESEM · Tomo II · Servicios")
-st.caption("Trabajo con Excel · revisión por servicio, empresa y CPC · cinco cargas")
+st.caption("Trabajo con Excel · revisión por empresa, CPC y servicio · cinco cargas")
 catalog = get_catalog()
 
 with st.sidebar:
     st.header("Archivos de trabajo")
     uploaded = st.file_uploader("Cargar base o avance (.xlsx)", type=["xlsx"], key="source_upload")
-    if st.button("Abrir archivo", disabled=uploaded is None):
+    if uploaded is not None:
         try:
-            candidate = load_state(uploaded.getvalue())
-            install_state(candidate, "Archivo cargado. Los avances previos y las cargas se restauraron.")
+            content = uploaded.getvalue()
+            signature = sha256(content).hexdigest()
+            if signature != st.session_state.get("uploaded_signature"):
+                candidate = load_state(content)
+                st.session_state["uploaded_signature"] = signature
+                install_state(candidate, "Archivo cargado. Los avances previos y las cargas se restauraron.")
         except Exception as exc:
             st.error(f"No se pudo cargar: {exc}")
     st.divider()
@@ -121,6 +164,8 @@ state = st.session_state.get("workbook_state")
 notice = st.session_state.pop("notice", None)
 if notice:
     st.success(notice)
+for error in st.session_state.pop("save_errors", []):
+    st.error(error)
 if state is None:
     st.info("Carga la base para distribuir empresas entre cinco cargas. Descarga el Excel maestro y entrega una copia a cada revisor. Cada persona selecciona su carga, revisa y descarga su avance. Finalmente, consolida los cinco archivos aquí.")
     st.stop()
@@ -133,8 +178,11 @@ active = [r for r in all_items if not r["validation"]["other"]]
 
 with st.sidebar:
     st.text_input("Tu nombre", key="my_name")
-    selected_load = st.selectbox("Carga que revisarás", ["Todas (coordinación)", *LOADS],
-                                  index=1, key=f"load_{generation}")
+    load_options = ["Todas (coordinación)", *LOADS]
+    preferred_load = st.session_state.get("preferred_load", "Carga 1")
+    selected_load = st.selectbox("Carga que revisarás", load_options,
+                                  index=load_options.index(preferred_load) if preferred_load in load_options else 1,
+                                  key=f"load_{generation}")
     totals = Counter(r["load"] for r in active)
     st.dataframe(pd.DataFrame([{"Carga": x, "Servicios": totals[x],
                                "Empresas": len({r['company_id'] for r in active if r['load'] == x})}
@@ -160,13 +208,48 @@ else:
     for row in visible:
         groups[row["company_id"]].append(row)
     summary = {company: summarize_company(rows) for company, rows in groups.items()}
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Servicios en la carga", len(visible))
     c2.metric("Empresas", len(groups))
     c3.metric("Revisados", sum(r["decision"] in ("Aceptado", "Cambio") for r in visible))
     c4.metric("Con alertas", sum(bool(r["validation"]["alerts"]) for r in visible))
+    c5.metric("Incumplimientos totales", sum(len(r["validation"]["alerts"]) for r in visible),
+              help="Suma de alertas automáticas; un servicio puede incumplir varias reglas.")
 
-    tab_s, tab_e, tab_c = st.tabs(["Por servicio", "Por empresa", "Por código CPC"])
+    tab_e, tab_c, tab_s = st.tabs(["Por empresa", "Por código CPC", "Por servicio"])
+    with tab_e:
+        st.subheader("Resumen de empresas")
+        st.caption("Cada columna de validación cuenta servicios que la incumplen. Incumplimientos suma todas las alertas.")
+        st.dataframe(pd.DataFrame([summary_row(company, rows) for company, rows in sorted(groups.items())]),
+                     hide_index=True, use_container_width=True, height=420)
+        companies = sorted(groups)
+        preferred_company = st.session_state.get("preferred_company")
+        company = st.selectbox("Seleccionar empresa para revisar", companies,
+            index=companies.index(preferred_company) if preferred_company in companies else 0,
+            key=f"company_{generation}")
+        info = summary[company]
+        st.write(f"Correspondencias: **{info['matches']} de {info['total']}** · "
+                 f"mínimo: **{'Cumple' if info['minimum_met'] else 'No cumple'}** · "
+                 f"revisados: **{info['reviewed']}**")
+        edit_matrix(groups[company], state, catalog, f"company_{generation}_{company}")
+    with tab_c:
+        by_cpc = defaultdict(list)
+        for row in visible:
+            by_cpc[row["validation"]["cpc4"] or "Sin CPC válido"].append(row)
+        st.subheader("Resumen por código CPC")
+        st.dataframe(pd.DataFrame([{
+            "CPC4": code, "Descripción": catalog.cpc_names.get(code, "Sin descripción"),
+            "Empresas": len({r['company_id'] for r in rows}),
+            **{k: v for k, v in summary_row(code, rows).items() if k != "Grupo"},
+        } for code, rows in sorted(by_cpc.items())]), hide_index=True,
+            use_container_width=True, height=420)
+        codes = sorted(by_cpc)
+        preferred_cpc = st.session_state.get("preferred_cpc")
+        code = st.selectbox("Seleccionar código CPC4 para revisar", codes,
+            index=codes.index(preferred_cpc) if preferred_cpc in codes else 0,
+            key=f"cpc_{generation}")
+        st.caption(f"{code} · {catalog.cpc_names.get(code, 'Sin descripción')}")
+        edit_matrix(by_cpc[code], state, catalog, f"cpc_{generation}_{code}")
     with tab_s:
         q1, q2, q3 = st.columns(3)
         query = q1.text_input("Empresa o servicio", key=f"query_{generation}")
@@ -178,27 +261,9 @@ else:
             and (decision_filter == "Todas" or r["decision"] == decision_filter)]
         st.dataframe(table(selection), hide_index=True, use_container_width=True, height=380)
         if selection:
-            review_form(picker(selection, f"service_{generation}"), state, catalog, f"service_{generation}")
-    with tab_e:
-        company = st.selectbox("Empresa", sorted(groups), key=f"company_{generation}")
-        info = summary[company]
-        st.write(f"Correspondencias: **{info['matches']} de {info['total']}** · "
-                 f"mínimo: **{'Cumple' if info['minimum_met'] else 'No cumple'}** · "
-                 f"revisados: **{info['reviewed']}**")
-        st.dataframe(table(groups[company]), hide_index=True, use_container_width=True)
-        review_form(picker(groups[company], f"company_record_{generation}"), state, catalog, f"company_{generation}")
-    with tab_c:
-        by_cpc = defaultdict(list)
-        for row in visible:
-            by_cpc[row["validation"]["cpc4"] or "Sin CPC válido"].append(row)
-        st.dataframe(pd.DataFrame([{"CPC4": code,
-            "Descripción": catalog.cpc_names.get(code, "Sin descripción"),
-            "Servicios": len(rows), "Empresas": len({r['company_id'] for r in rows}),
-            "Con alertas": sum(bool(r["validation"]["alerts"]) for r in rows)}
-            for code, rows in sorted(by_cpc.items())]), hide_index=True, use_container_width=True)
-        code = st.selectbox("Código CPC4", sorted(by_cpc), key=f"cpc_{generation}")
-        st.dataframe(table(by_cpc[code]), hide_index=True, use_container_width=True)
-        review_form(picker(by_cpc[code], f"cpc_record_{generation}"), state, catalog, f"cpc_{generation}")
+            service = st.selectbox("Servicio para revisar", selection, key=f"service_{generation}",
+                format_func=lambda r: f"{r['company_id']} · {r['service_id']} · {norm(r['source'].get('Descripción del servicio'))[:65]}")
+            edit_matrix([service], state, catalog, f"service_{generation}_{service['company_id']}_{service['service_id']}")
 
 st.divider()
 st.subheader("Descargar avance")
