@@ -18,6 +18,8 @@ def install_state(state: dict, message: str):
     st.session_state["workbook_state"] = state
     st.session_state["generation"] = st.session_state.get("generation", 0) + 1
     st.session_state.pop("download_bytes", None)
+    st.session_state.pop("preferred_company", None)
+    st.session_state.pop("preferred_cpc", None)
     st.session_state["notice"] = message
     st.rerun()
 
@@ -58,6 +60,17 @@ def summary_row(label, rows):
             "Con alertas": sum(bool(r["validation"]["alerts"]) for r in rows),
             "Incumplimientos": sum(len(r["validation"]["alerts"]) for r in rows),
             **checks}
+
+
+def company_summary(company, rows):
+    source_rows = [r["source"] for r in rows]
+    def first_value(field):
+        return next((norm(source.get(field)) for source in source_rows
+                     if norm(source.get(field))), "")
+    return {"id_empresa": company, "ruc": first_value("ruc"),
+            "nombre_comercial": first_value("nombre_comercial"),
+            "razon_social": first_value("razon_social"),
+            **{k: v for k, v in summary_row(company, rows).items() if k != "Grupo"}}
 
 
 def edit_matrix(items: list[dict], state: dict, catalog, key: str):
@@ -118,8 +131,6 @@ def edit_matrix(items: list[dict], state: dict, catalog, key: str):
         if saved:
             st.session_state.pop("download_bytes", None)
             st.session_state["preferred_load"] = selected_load
-            st.session_state["preferred_company"] = st.session_state.get(f"company_{st.session_state['generation']}")
-            st.session_state["preferred_cpc"] = st.session_state.get(f"cpc_{st.session_state['generation']}")
             st.session_state["generation"] += 1
             st.session_state["notice"] = f"{saved} revisión(es) guardada(s) en esta sesión. Descarga el Excel para conservarlas."
         if failures:
@@ -220,36 +231,66 @@ else:
     with tab_e:
         st.subheader("Resumen de empresas")
         st.caption("Cada columna de validación cuenta servicios que la incumplen. Incumplimientos suma todas las alertas.")
-        st.dataframe(pd.DataFrame([summary_row(company, rows) for company, rows in sorted(groups.items())]),
-                     hide_index=True, use_container_width=True, height=420)
-        companies = sorted(groups)
-        preferred_company = st.session_state.get("preferred_company")
-        company = st.selectbox("Seleccionar empresa para revisar", companies,
-            index=companies.index(preferred_company) if preferred_company in companies else 0,
-            key=f"company_{generation}")
-        info = summary[company]
-        st.write(f"Correspondencias: **{info['matches']} de {info['total']}** · "
-                 f"mínimo: **{'Cumple' if info['minimum_met'] else 'No cumple'}** · "
-                 f"revisados: **{info['reviewed']}**")
-        edit_matrix(groups[company], state, catalog, f"company_{generation}_{company}")
+        q_company, only_alerts = st.columns([3, 1])
+        company_query = q_company.text_input("Buscar por ID, RUC o nombre", key=f"company_query_{generation}")
+        company_alerts = only_alerts.checkbox("Solo con alertas", key=f"company_alerts_{generation}")
+        company_rows = [company_summary(company, rows) for company, rows in sorted(groups.items())]
+        if company_query:
+            company_rows = [r for r in company_rows if company_query.casefold() in
+                " ".join(str(r[k]) for k in ("id_empresa", "ruc", "nombre_comercial", "razon_social")).casefold()]
+        if company_alerts:
+            company_rows = [r for r in company_rows if r["Con alertas"]]
+        if company_rows:
+            company_event = st.dataframe(pd.DataFrame(company_rows), hide_index=True,
+                use_container_width=True, height=420, on_select="rerun", selection_mode="single-row",
+                key=f"company_summary_{generation}_{selected_load}_{company_query}_{company_alerts}")
+            selected = company_event.selection.rows
+            if selected:
+                st.session_state["preferred_company"] = company_rows[selected[0]]["id_empresa"]
+            company = (company_rows[selected[0]]["id_empresa"] if selected else
+                       st.session_state.get("preferred_company"))
+            if company in {r["id_empresa"] for r in company_rows}:
+                st.subheader(f"Empresa {company}")
+                info = summary[company]
+                st.write(f"Correspondencias: **{info['matches']} de {info['total']}** · "
+                         f"mínimo: **{'Cumple' if info['minimum_met'] else 'No cumple'}** · "
+                         f"revisados: **{info['reviewed']}**")
+                edit_matrix(groups[company], state, catalog, f"company_{generation}_{company}")
+            else:
+                st.info("Selecciona una fila de la matriz para revisar esa empresa.")
+        else:
+            st.info("No hay empresas con esos filtros.")
     with tab_c:
         by_cpc = defaultdict(list)
         for row in visible:
             by_cpc[row["validation"]["cpc4"] or "Sin CPC válido"].append(row)
         st.subheader("Resumen por código CPC")
-        st.dataframe(pd.DataFrame([{
+        cpc_rows = [{
             "CPC4": code, "Descripción": catalog.cpc_names.get(code, "Sin descripción"),
             "Empresas": len({r['company_id'] for r in rows}),
             **{k: v for k, v in summary_row(code, rows).items() if k != "Grupo"},
-        } for code, rows in sorted(by_cpc.items())]), hide_index=True,
-            use_container_width=True, height=420)
-        codes = sorted(by_cpc)
-        preferred_cpc = st.session_state.get("preferred_cpc")
-        code = st.selectbox("Seleccionar código CPC4 para revisar", codes,
-            index=codes.index(preferred_cpc) if preferred_cpc in codes else 0,
-            key=f"cpc_{generation}")
-        st.caption(f"{code} · {catalog.cpc_names.get(code, 'Sin descripción')}")
-        edit_matrix(by_cpc[code], state, catalog, f"cpc_{generation}_{code}")
+        } for code, rows in sorted(by_cpc.items())]
+        cpc_query = st.text_input("Buscar código o descripción", key=f"cpc_query_{generation}")
+        if cpc_query:
+            cpc_rows = [r for r in cpc_rows if cpc_query.casefold() in
+                        (r["CPC4"] + " " + r["Descripción"]).casefold()]
+        if cpc_rows:
+            cpc_event = st.dataframe(pd.DataFrame(cpc_rows), hide_index=True,
+                use_container_width=True, height=420, on_select="rerun", selection_mode="single-row",
+                key=f"cpc_summary_{generation}_{selected_load}_{cpc_query}")
+            selected = cpc_event.selection.rows
+            if selected:
+                st.session_state["preferred_cpc"] = cpc_rows[selected[0]]["CPC4"]
+            code = (cpc_rows[selected[0]]["CPC4"] if selected else
+                    st.session_state.get("preferred_cpc"))
+            if code in {r["CPC4"] for r in cpc_rows}:
+                st.subheader(f"CPC {code}")
+                st.caption(catalog.cpc_names.get(code, "Sin descripción"))
+                edit_matrix(by_cpc[code], state, catalog, f"cpc_{generation}_{code}")
+            else:
+                st.info("Selecciona una fila de la matriz para revisar ese código CPC.")
+        else:
+            st.info("No hay códigos con ese filtro.")
     with tab_s:
         q1, q2, q3 = st.columns(3)
         query = q1.text_input("Empresa o servicio", key=f"query_{generation}")
