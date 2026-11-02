@@ -73,6 +73,39 @@ def company_summary(company, rows):
             **{k: v for k, v in summary_row(company, rows).items() if k != "Grupo"}}
 
 
+def company_profile(company, rows):
+    """Datos informados por la empresa, sin tomar valores de la revisión."""
+    sources = [r["source"] for r in rows]
+    def field(name):
+        return next((norm(source.get(name)) for source in sources
+                     if norm(source.get(name))), "")
+    st.subheader(f"Información de la empresa {company}")
+    with st.container(border=True):
+        a, b, c, d = st.columns(4)
+        a.write("**RUC**")
+        a.write(field("ruc") or "—")
+        b.write("**Nombre comercial**")
+        b.write(field("nombre_comercial") or "—")
+        c.write("**Razón social**")
+        c.write(field("razon_social") or "—")
+        d.write("**Zonal**")
+        d.write(field("inec_zonal") or "—")
+        st.write("**Actividades y CIIU informados**")
+        activities = (
+            ("Principal", "actividad_principal", "ciiu4_actividad_principal", "desc_actividad_principal"),
+            ("Secundaria", "actividad_secundaria", "ciiu4_actividad_secundaria", "desc_actividad_secundaria"),
+            ("Tercera", "tercera_actividad", "ciiu4_tercera_actividad", "desc_tercera_actividad"),
+        )
+        for column, (label, activity, ciiu, description) in zip(st.columns(3), activities):
+            with column:
+                st.write(f"**{label}**")
+                st.write(f"CIIU: {field(ciiu) or '—'}")
+                if field(description):
+                    st.caption(field(description))
+                elif field(activity):
+                    st.caption(field(activity))
+
+
 def edit_matrix(items: list[dict], state: dict, catalog, key: str):
     """Revisa varios servicios en una cuadrícula; los datos del informante son de lectura."""
     rows = []
@@ -226,6 +259,12 @@ else:
     c4.metric("Con alertas", sum(bool(r["validation"]["alerts"]) for r in visible))
     c5.metric("Incumplimientos totales", sum(len(r["validation"]["alerts"]) for r in visible),
               help="Suma de alertas automáticas; un servicio puede incumplir varias reglas.")
+    st.subheader("Alertas por regla")
+    st.caption("Cantidad de servicios de la carga que incumplen cada validación; se excluyen las filas Otros.")
+    counts = alert_counts(visible)
+    for start in range(0, len(CHECKS), 4):
+        for column, (name, count) in zip(st.columns(4), list(counts.items())[start:start + 4]):
+            column.metric(name, count)
 
     tab_e, tab_c, tab_s = st.tabs(["Por empresa", "Por código CPC", "Por servicio"])
     with tab_e:
@@ -250,7 +289,7 @@ else:
             company = (company_rows[selected[0]]["id_empresa"] if selected else
                        st.session_state.get("preferred_company"))
             if company in {r["id_empresa"] for r in company_rows}:
-                st.subheader(f"Empresa {company}")
+                company_profile(company, groups[company])
                 info = summary[company]
                 st.write(f"Correspondencias: **{info['matches']} de {info['total']}** · "
                          f"mínimo: **{'Cumple' if info['minimum_met'] else 'No cumple'}** · "
