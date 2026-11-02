@@ -26,7 +26,7 @@ def install_state(state: dict, message: str):
 
 def table(items: list[dict]) -> pd.DataFrame:
     return pd.DataFrame([{
-        "Carga": r["load"], "Empresa": r["company_id"], "id_serv": r["service_id"],
+        "Carga": r["load"], "Empresa": r["company_id"],
         "Servicio": norm(r["source"].get("Descripción del servicio")),
         "CPC original": norm(r["source"].get("Código CPC")),
         "CPC vigente": r["validation"]["code"], "CPC4": r["validation"]["cpc4"],
@@ -45,6 +45,16 @@ CHECKS = {
     "Actividad servicio": "Ninguna actividad de servicio",
     "División excluida": "Actividad en división no investigada",
     "CIIU actividad": "CIIU del servicio no coincide",
+}
+RULE_HELP = {
+    "Formato": "El código informado debe tener ocho dígitos: cuatro de CIIU y cuatro de CPC.",
+    "Código Otros": "99999999 está reservado para la fila Otros; no debe codificar otro servicio.",
+    "CIIU código": "Los cuatro primeros dígitos del código no figuran entre los CIIU de servicios o excepción del catálogo.",
+    "CPC código": "Los cuatro últimos dígitos del código no figuran entre los CPC de servicios o excepción del catálogo.",
+    "Par CIIU–CPC": "La combinación de los ocho dígitos no aparece en la tabla de correspondencias; requiere revisión.",
+    "Actividad servicio": "Ninguna de las tres actividades de la empresa se reconoce como servicio o actividad de excepción.",
+    "División excluida": "Hay una actividad en las divisiones K64, K66, Q88 o S94, que requieren revisar su tratamiento.",
+    "CIIU actividad": "Los cuatro dígitos CIIU del servicio no coinciden con los de ninguna actividad informada por la empresa.",
 }
 
 
@@ -73,7 +83,7 @@ def company_summary(company, rows):
             **{k: v for k, v in summary_row(company, rows).items() if k != "Grupo"}}
 
 
-def company_profile(company, rows):
+def company_profile(company, rows, catalog):
     """Datos informados por la empresa, sin tomar valores de la revisión."""
     sources = [r["source"] for r in rows]
     def field(name):
@@ -104,6 +114,23 @@ def company_profile(company, rows):
                     st.caption(field(description))
                 elif field(activity):
                     st.caption(field(activity))
+        with st.expander("Consultar CPC posibles según las actividades de esta empresa"):
+            st.caption("Correspondencias del catálogo para cada CIIU completo. Son opciones de referencia; la descripción del servicio informado determina la codificación.")
+            for label, activity, ciiu, description in activities:
+                full_activity = field(ciiu).upper().replace(".", "")
+                if not full_activity:
+                    continue
+                possible = catalog.activity_pairs.get(full_activity, ())
+                st.write(f"**{label}: {full_activity} · {len(possible)} código(s)**")
+                if possible:
+                    st.dataframe(pd.DataFrame([{
+                        "Código CIIU–CPC": code,
+                        "CPC4": code[4:],
+                        "Descripción del CPC": desc or catalog.cpc_names.get(code[4:], ""),
+                    } for code, desc in possible]), hide_index=True,
+                        use_container_width=True, height=min(260, 38 * (len(possible) + 1)))
+                else:
+                    st.caption("Sin correspondencias para este CIIU completo en el catálogo.")
 
 
 def edit_matrix(items: list[dict], state: dict, catalog, key: str):
@@ -111,16 +138,18 @@ def edit_matrix(items: list[dict], state: dict, catalog, key: str):
     rows = []
     for r in items:
         rows.append({
-            "Empresa": r["company_id"], "id_serv": r["service_id"],
+            "Empresa": r["company_id"],
             "Descripción": norm(r["source"].get("Descripción del servicio")),
             "CPC original": norm(r["source"].get("Código CPC")),
-            "CPC corregido": r["edited_code"], "Alertas": " | ".join(r["validation"]["alerts"]),
+            "CPC corregido": r["edited_code"],
+            "Descripción del CPC vigente": r["validation"]["cpc_name"],
+            "Alertas": " | ".join(r["validation"]["alerts"]),
             "Decisión": r["decision"], "Responsable": r["reviewer"],
             "Revisar": r["review_note"], "Observaciones": r["observations"],
         })
     st.caption("Edita las celdas blancas y pulsa Guardar cambios. El CPC original y los datos informados son de lectura.")
     frame = pd.DataFrame(rows)
-    disabled = ["Empresa", "id_serv", "Descripción", "CPC original", "Alertas"]
+    disabled = ["Empresa", "Descripción", "CPC original", "Descripción del CPC vigente", "Alertas"]
     edited = st.data_editor(frame, key=f"grid_{key}", hide_index=True,
         use_container_width=True, height=min(560, 88 + 36 * len(rows)),
         disabled=disabled, num_rows="fixed",
@@ -128,20 +157,22 @@ def edit_matrix(items: list[dict], state: dict, catalog, key: str):
             "Decisión": st.column_config.SelectboxColumn(options=["Pendiente", "Aceptado", "Cambio"], required=True),
             "CPC corregido": st.column_config.TextColumn(help="Código de ocho dígitos, sin modificar el original"),
             "Descripción": st.column_config.TextColumn(width="large"),
+            "Descripción del CPC vigente": st.column_config.TextColumn(width="large", help="Descripción del CPC del código vigente. Se actualiza después de guardar una corrección."),
             "Alertas": st.column_config.TextColumn(width="large"),
             "Revisar": st.column_config.TextColumn(width="medium"),
             "Observaciones": st.column_config.TextColumn(width="medium"),
         })
     with st.expander("Justificaciones y revisión PC (opcionales)"):
         extras = pd.DataFrame([{
-            "id_serv": r["service_id"], "Justificación CIIU": r["just_ciiu"],
+            "Servicio": norm(r["source"].get("Descripción del servicio")),
+            "Justificación CIIU": r["just_ciiu"],
             "Justificación CPC": r["just_cpc"],
             "Justificación correspondencia": r["just_match"],
             "Revisión PC": r["review_pc"],
         } for r in items])
         extra_edit = st.data_editor(extras, key=f"extras_{key}", hide_index=True,
             use_container_width=True, height=min(420, 88 + 36 * len(rows)),
-            disabled=["id_serv"], num_rows="fixed")
+            disabled=["Servicio"], num_rows="fixed")
     if st.button("Guardar cambios de la matriz", key=f"save_{key}", type="primary"):
         failures, saved = [], 0
         for idx, item in enumerate(items):
@@ -259,12 +290,12 @@ else:
     c4.metric("Con alertas", sum(bool(r["validation"]["alerts"]) for r in visible))
     c5.metric("Incumplimientos totales", sum(len(r["validation"]["alerts"]) for r in visible),
               help="Suma de alertas automáticas; un servicio puede incumplir varias reglas.")
-    st.subheader("Alertas por regla")
-    st.caption("Cantidad de servicios de la carga que incumplen cada validación; se excluyen las filas Otros.")
-    counts = alert_counts(visible)
-    for start in range(0, len(CHECKS), 4):
-        for column, (name, count) in zip(st.columns(4), list(counts.items())[start:start + 4]):
-            column.metric(name, count)
+    with st.expander("Alertas por regla"):
+        st.caption("Cantidad de servicios de la carga que incumplen cada validación; se excluyen las filas Otros. Coloca el cursor sobre ⓘ para ver la regla.")
+        counts = alert_counts(visible)
+        for start in range(0, len(CHECKS), 4):
+            for column, (name, count) in zip(st.columns(4), list(counts.items())[start:start + 4]):
+                column.metric(name, count, help=RULE_HELP[name])
 
     tab_e, tab_c, tab_s = st.tabs(["Por empresa", "Por código CPC", "Por servicio"])
     with tab_e:
@@ -289,7 +320,7 @@ else:
             company = (company_rows[selected[0]]["id_empresa"] if selected else
                        st.session_state.get("preferred_company"))
             if company in {r["id_empresa"] for r in company_rows}:
-                company_profile(company, groups[company])
+                company_profile(company, groups[company], catalog)
                 info = summary[company]
                 st.write(f"Correspondencias: **{info['matches']} de {info['total']}** · "
                          f"mínimo: **{'Cumple' if info['minimum_met'] else 'No cumple'}** · "
@@ -342,7 +373,7 @@ else:
         st.dataframe(table(selection), hide_index=True, use_container_width=True, height=380)
         if selection:
             service = st.selectbox("Servicio para revisar", selection, key=f"service_{generation}",
-                format_func=lambda r: f"{r['company_id']} · {r['service_id']} · {norm(r['source'].get('Descripción del servicio'))[:65]}")
+                format_func=lambda r: f"{r['company_id']} · {r['validation']['code']} · {norm(r['source'].get('Descripción del servicio'))[:65]}")
             edit_matrix([service], state, catalog, f"service_{generation}_{service['company_id']}_{service['service_id']}")
 
 st.divider()

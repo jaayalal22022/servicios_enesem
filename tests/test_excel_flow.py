@@ -38,6 +38,13 @@ class ExcelFlowTest(unittest.TestCase):
     def setUpClass(cls):
         cls.catalog = get_catalog()
 
+    def test_activity_cpc_reference_uses_complete_ciiu_and_unique_codes(self):
+        pairs = self.catalog.activity_pairs
+        self.assertEqual(len(pairs["C102002"]), 5)
+        self.assertEqual([code for code, _ in pairs["G463033"]], ["46306112"])
+        self.assertEqual({code for code, _ in pairs["H521000"]},
+                         {"52106721", "52106722", "52106729"})
+
     def test_roundtrip_preserves_assignments_decisions_and_values(self):
         state = load_state(input_excel())
         rows = state["rows"]

@@ -47,6 +47,7 @@ class Catalog:
     combinations: frozenset[str]
     cpc_names: dict[str, str]
     exception_names: dict[str, str]
+    activity_pairs: dict[str, tuple[tuple[str, str], ...]]
 
 
 @lru_cache(maxsize=1)
@@ -63,16 +64,22 @@ def get_catalog() -> Catalog:
             ciiu.add(group.zfill(4))
         if product:
             cpc.add(product.zfill(4))
-    combinations, cpc_names = set(), {}
+    combinations, cpc_names, activity_pairs = set(), {}, {}
     for row in book["cpc ciiu"].iter_rows(min_row=2, values_only=True):
+        activity = norm(row[0]).upper()
         combined, product, name = norm(row[5]), norm(row[6]), norm(row[7])
         if re.fullmatch(r"\d{8}", combined):
             combinations.add(combined)
+            if activity:
+                pairs = activity_pairs.setdefault(activity, {})
+                if combined not in pairs or (name and name != "#N/A"):
+                    pairs[combined] = name
         if product and name and name != "#N/A":
             cpc_names.setdefault(product.zfill(4), name)
     book.close()
     return Catalog(frozenset(exceptions), frozenset(ciiu), frozenset(cpc),
-                   frozenset(combinations), cpc_names, exception_names)
+                   frozenset(combinations), cpc_names, exception_names,
+                   {key: tuple(sorted(pairs.items())) for key, pairs in activity_pairs.items()})
 
 
 def parse_upload(content: bytes) -> tuple[list[dict], list[str], list[str]]:
