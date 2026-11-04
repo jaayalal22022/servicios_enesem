@@ -112,6 +112,8 @@ def load_state(content: bytes) -> dict:
                         header = f"review_{field}"
                         if header in h:
                             lookup[key]["review"][field] = norm(values[h[header]])
+                    if lookup[key]["review"]["decision"] == "Aceptado":
+                        lookup[key]["review"]["decision"] = "Justificación"
     history = []
     if "Historial" in book.sheetnames:
         sheet = book["Historial"]
@@ -153,6 +155,8 @@ def update_review(state: dict, key: tuple[str, str], changes: dict, catalog):
         raise ValueError("Servicio no evaluable o no encontrado.")
     if set(changes) != set(REVIEW_KEYS):
         raise ValueError("Faltan campos de revisión.")
+    if changes["decision"] not in ("Pendiente", "Justificación", "Cambio"):
+        raise ValueError("La decisión debe ser Pendiente, Justificación o Cambio.")
     candidate = evaluate(row["source"], changes["edited_code"], catalog)
     edited = norm(changes["edited_code"])
     if edited and (not candidate["code_ok"] or edited == "99999999"):
@@ -161,7 +165,11 @@ def update_review(state: dict, key: tuple[str, str], changes: dict, catalog):
         raise ValueError("Para marcar Cambio, escribe un CPC distinto del original.")
     if not norm(changes["reviewer"]):
         raise ValueError("Indica el nombre del responsable.")
-    if changes["decision"] in ("Aceptado", "Cambio") and candidate["alerts"] and not any(
+    if changes["decision"] == "Justificación" and not any(
+        norm(changes[k]) for k in ("just_ciiu", "just_cpc", "just_match", "observations")
+    ):
+        raise ValueError("Registra la justificación o una observación para esta decisión.")
+    if changes["decision"] == "Cambio" and candidate["alerts"] and not any(
         norm(changes[k]) for k in ("just_ciiu", "just_cpc", "just_match", "observations")
     ):
         raise ValueError("Hay alertas. Registra una justificación u observación.")

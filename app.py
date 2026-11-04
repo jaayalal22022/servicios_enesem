@@ -6,7 +6,7 @@ from hashlib import sha256
 import pandas as pd
 import streamlit as st
 
-from engine import evaluate, get_catalog, is_other, norm, summarize_company
+from engine import ciiu_for_code, get_catalog, norm, summarize_company
 from workflow import (LOADS, MergeConflict, assign_company, export_state, identity,
                       load_state, merge_states, reviewed_rows, update_review)
 
@@ -66,7 +66,7 @@ def alert_counts(items):
 def summary_row(label, rows):
     checks = alert_counts(rows)
     return {"Grupo": label, "Servicios": len(rows),
-            "Revisados": sum(r["decision"] in ("Aceptado", "Cambio") for r in rows),
+            "Revisados": sum(r["decision"] in ("Justificación", "Cambio") for r in rows),
             "Con alertas": sum(bool(r["validation"]["alerts"]) for r in rows),
             "Incumplimientos": sum(len(r["validation"]["alerts"]) for r in rows),
             **checks}
@@ -133,12 +133,59 @@ def company_profile(company, rows, catalog):
                     st.caption("Sin correspondencias para este CIIU completo en el catálogo.")
 
 
-def edit_matrix(items: list[dict], state: dict, catalog, key: str):
+def reverse_lookup(items, catalog, key):
+    with st.expander("Consultar actividades CIIU de un código registrado"):
+        st.caption("Selecciona un servicio para ver los CIIU asociados a su código de ocho dígitos.")
+        choices = pd.DataFrame([{"Empresa": r["company_id"],
+            "Servicio informado": norm(r["source"].get("Descripción del servicio")),
+            "Código original": norm(r["source"].get("Código CPC")),
+            "Código vigente": r["validation"]["code"]} for r in items])
+        event = st.dataframe(choices, hide_index=True, use_container_width=True,
+            height=min(250, 88 + 36 * len(items)), on_select="rerun",
+            selection_mode="single-row", key=f"reverse_pick_{key}")
+        if not event.selection.rows:
+            st.info("Selecciona una fila para consultar el código.")
+            return
+        item = items[event.selection.rows[0]]
+        code = item["validation"]["code"]
+        original = norm(item["source"].get("Código CPC"))
+        if original != code:
+            code = st.radio("Código a consultar", [original, code], horizontal=True,
+                            key=f"reverse_code_{key}_{item['service_id']}")
+        broader = st.checkbox("Mostrar también otros CIIU del mismo CPC4", key=f"reverse_broad_{key}")
+        matches = ciiu_for_code(catalog, code, include_same_cpc=broader)
+        if not matches:
+            st.warning("El catálogo no contiene correspondencias para este código.")
+            return
+        source = item["source"]
+        own = {
+            norm(source.get("ciiu4_actividad_principal")).upper().replace(".", ""): "Principal",
+            norm(source.get("ciiu4_actividad_secundaria")).upper().replace(".", ""): "Secundaria",
+            norm(source.get("ciiu4_tercera_actividad")).upper().replace(".", ""): "Tercera",
+        }
+        st.dataframe(pd.DataFrame([{"CIIU": activity, "Descripción de actividad": description,
+            "Código CIIU–CPC": combined,
+            "En esta empresa": own.get(activity, "No consta")}
+            for activity, description, combined in matches]), hide_index=True,
+            use_container_width=True, height=min(350, 88 + 36 * len(matches)))
+
+
+def edit_matrix(items: list[dict], state: dict, catalog, key: str,
+                show_activities: bool = False, show_identity: bool = False):
     """Revisa varios servicios en una cuadrícula; los datos del informante son de lectura."""
     rows = []
     for r in items:
-        rows.append({
-            "Empresa": r["company_id"],
+        source = r["source"]
+        row = {"Empresa": r["company_id"]}
+        if show_identity:
+            row.update({"RUC": norm(source.get("ruc")),
+                        "Nombre comercial": norm(source.get("nombre_comercial")),
+                        "Razón social": norm(source.get("razon_social"))})
+        if show_activities:
+            row.update({"CIIU principal": norm(source.get("ciiu4_actividad_principal")),
+                        "CIIU secundaria": norm(source.get("ciiu4_actividad_secundaria")),
+                        "CIIU tercera": norm(source.get("ciiu4_tercera_actividad"))})
+        row.update({
             "Descripción": norm(r["source"].get("Descripción del servicio")),
             "CPC original": norm(r["source"].get("Código CPC")),
             "CPC corregido": r["edited_code"],
@@ -147,14 +194,16 @@ def edit_matrix(items: list[dict], state: dict, catalog, key: str):
             "Decisión": r["decision"], "Responsable": r["reviewer"],
             "Revisar": r["review_note"], "Observaciones": r["observations"],
         })
+        rows.append(row)
     st.caption("Edita las celdas blancas y pulsa Guardar cambios. El CPC original y los datos informados son de lectura.")
     frame = pd.DataFrame(rows)
-    disabled = ["Empresa", "Descripción", "CPC original", "Descripción del CPC vigente", "Alertas"]
+    disabled = ["Empresa", "Descripción", "CPC original", "Descripción del CPC vigente", "Alertas",
+                "RUC", "Nombre comercial", "Razón social", "CIIU principal", "CIIU secundaria", "CIIU tercera"]
     edited = st.data_editor(frame, key=f"grid_{key}", hide_index=True,
         use_container_width=True, height=min(560, 88 + 36 * len(rows)),
-        disabled=disabled, num_rows="fixed",
+        disabled=[column for column in disabled if column in frame.columns], num_rows="fixed",
         column_config={
-            "Decisión": st.column_config.SelectboxColumn(options=["Pendiente", "Aceptado", "Cambio"], required=True),
+            "Decisión": st.column_config.SelectboxColumn(options=["Pendiente", "Justificación", "Cambio"], required=True),
             "CPC corregido": st.column_config.TextColumn(help="Código de ocho dígitos, sin modificar el original"),
             "Descripción": st.column_config.TextColumn(width="large"),
             "Descripción del CPC vigente": st.column_config.TextColumn(width="large", help="Descripción del CPC del código vigente. Se actualiza después de guardar una corrección."),
@@ -203,10 +252,19 @@ def edit_matrix(items: list[dict], state: dict, catalog, key: str):
             st.rerun()
         if not failures:
             st.info("No hubo cambios para guardar.")
+    reverse_lookup(items, catalog, key)
 
 
-st.title("ENESEM · Tomo II · Servicios")
-st.caption("Trabajo con Excel · revisión por empresa, CPC y servicio · cinco cargas")
+st.markdown("""<style>
+.enesem-hero {background:linear-gradient(105deg,#19395f,#2f6ee8);color:white;
+  padding:24px 30px;border-radius:16px;margin:0 0 18px 0}
+.enesem-hero h1 {color:white;font-size:2.1rem;line-height:1.2;margin:0 0 9px}
+.enesem-hero p {color:#edf4ff;margin:0}
+div[data-testid="stMetric"] {background:#eaf2ff;border:1px solid #d6e5ff;
+  border-radius:12px;padding:12px 16px}
+</style><div class="enesem-hero"><h1>ENESEM · Tomo II · Servicios</h1>
+<p>Revisión por empresa, código CPC y servicio · cinco cargas · avances en Excel</p></div>""",
+    unsafe_allow_html=True)
 catalog = get_catalog()
 
 with st.sidebar:
@@ -286,7 +344,7 @@ else:
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Servicios en la carga", len(visible))
     c2.metric("Empresas", len(groups))
-    c3.metric("Revisados", sum(r["decision"] in ("Aceptado", "Cambio") for r in visible))
+    c3.metric("Revisados", sum(r["decision"] in ("Justificación", "Cambio") for r in visible))
     c4.metric("Con alertas", sum(bool(r["validation"]["alerts"]) for r in visible))
     c5.metric("Incumplimientos totales", sum(len(r["validation"]["alerts"]) for r in visible),
               help="Suma de alertas automáticas; un servicio puede incumplir varias reglas.")
@@ -356,7 +414,20 @@ else:
             if code in {r["CPC4"] for r in cpc_rows}:
                 st.subheader(f"CPC {code}")
                 st.caption(catalog.cpc_names.get(code, "Sin descripción"))
-                edit_matrix(by_cpc[code], state, catalog, f"cpc_{generation}_{code}")
+                f1, f2 = st.columns(2)
+                only_cpc_alerts = f1.checkbox("Solo con alertas en este CPC",
+                    key=f"only_cpc_alerts_{generation}_{code}")
+                show_identity = f2.checkbox("Mostrar RUC y nombres de empresa",
+                    key=f"show_identity_{generation}_{code}")
+                code_items = [r for r in by_cpc[code]
+                              if not only_cpc_alerts or r["validation"]["alerts"]]
+                st.caption(f"{len(code_items)} de {len(by_cpc[code])} servicios visibles")
+                if code_items:
+                    edit_matrix(code_items, state, catalog,
+                        f"cpc_{generation}_{code}_{only_cpc_alerts}_{show_identity}",
+                        show_activities=True, show_identity=show_identity)
+                else:
+                    st.info("Este código no tiene servicios con alertas.")
             else:
                 st.info("Selecciona una fila de la matriz para revisar ese código CPC.")
         else:
@@ -365,7 +436,7 @@ else:
         q1, q2, q3 = st.columns(3)
         query = q1.text_input("Empresa o servicio", key=f"query_{generation}")
         alert_filter = q2.selectbox("Alertas", ["Todas", "Con alertas", "Sin alertas"], key=f"alerts_{generation}")
-        decision_filter = q3.selectbox("Decisión", ["Todas", "Pendiente", "Aceptado", "Cambio"], key=f"decision_filter_{generation}")
+        decision_filter = q3.selectbox("Decisión", ["Todas", "Pendiente", "Justificación", "Cambio"], key=f"decision_filter_{generation}")
         selection = [r for r in visible if
             (not query or query.casefold() in (r["company_id"] + " " + norm(r["source"].get("Descripción del servicio"))).casefold())
             and (alert_filter == "Todas" or bool(r["validation"]["alerts"]) == (alert_filter == "Con alertas"))

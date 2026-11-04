@@ -48,6 +48,8 @@ class Catalog:
     cpc_names: dict[str, str]
     exception_names: dict[str, str]
     activity_pairs: dict[str, tuple[tuple[str, str], ...]]
+    activity_names: dict[str, str]
+    code_activities: dict[str, tuple[str, ...]]
 
 
 @lru_cache(maxsize=1)
@@ -64,13 +66,17 @@ def get_catalog() -> Catalog:
             ciiu.add(group.zfill(4))
         if product:
             cpc.add(product.zfill(4))
-    combinations, cpc_names, activity_pairs = set(), {}, {}
+    combinations, cpc_names, activity_pairs, activity_names, code_activities = set(), {}, {}, {}, {}
     for row in book["cpc ciiu"].iter_rows(min_row=2, values_only=True):
         activity = norm(row[0]).upper()
+        activity_name = norm(row[1])
         combined, product, name = norm(row[5]), norm(row[6]), norm(row[7])
         if re.fullmatch(r"\d{8}", combined):
             combinations.add(combined)
             if activity:
+                if activity_name and activity_name != "#N/A":
+                    activity_names.setdefault(activity, activity_name)
+                code_activities.setdefault(combined, set()).add(activity)
                 pairs = activity_pairs.setdefault(activity, {})
                 if combined not in pairs or (name and name != "#N/A"):
                     pairs[combined] = name
@@ -79,7 +85,21 @@ def get_catalog() -> Catalog:
     book.close()
     return Catalog(frozenset(exceptions), frozenset(ciiu), frozenset(cpc),
                    frozenset(combinations), cpc_names, exception_names,
-                   {key: tuple(sorted(pairs.items())) for key, pairs in activity_pairs.items()})
+                   {key: tuple(sorted(pairs.items())) for key, pairs in activity_pairs.items()},
+                   activity_names,
+                   {code: tuple(sorted(activities)) for code, activities in code_activities.items()})
+
+
+def ciiu_for_code(catalog: Catalog, code: str, include_same_cpc: bool = False) -> list[tuple[str, str, str]]:
+    """Correspondencias por código completo o por el CPC4, sin duplicados."""
+    code = norm(code)
+    if not re.fullmatch(r"\d{8}", code):
+        return []
+    codes = (c for c in catalog.code_activities if c[4:] == code[4:]) if include_same_cpc else (code,)
+    found = {(activity, combined) for combined in codes
+             for activity in catalog.code_activities.get(combined, ())}
+    return [(activity, catalog.activity_names.get(activity, ""), combined)
+            for activity, combined in sorted(found)]
 
 
 def parse_upload(content: bytes) -> tuple[list[dict], list[str], list[str]]:
@@ -131,7 +151,8 @@ def review_defaults(source: dict) -> dict:
         "edited_code": norm(source.get("cpc_act_8dígitos")),
         "review_note": norm(source.get("Revisar")),
         "reviewer": norm(source.get("Nombre del responsable")),
-        "decision": norm(source.get("Decisión")) or "Pendiente",
+        "decision": "Justificación" if norm(source.get("Decisión")) == "Aceptado"
+                    else norm(source.get("Decisión")) or "Pendiente",
         "just_ciiu": norm(source.get("Justificación CIIU")),
         "just_cpc": norm(source.get("Justificación CPC")),
         "just_match": norm(source.get("Justificación Correspondencia")),
@@ -192,4 +213,4 @@ def summarize_company(items: list[dict]) -> dict:
     count = sum(bool(r["validation"]["activity_match"]) for r in active)
     return {"total": len(active), "matches": count,
             "minimum_met": count > 0 if active else None,
-            "reviewed": sum(r["decision"] in ("Aceptado", "Cambio") for r in active)}
+            "reviewed": sum(r["decision"] in ("Justificación", "Cambio") for r in active)}

@@ -6,7 +6,7 @@ from pathlib import Path
 from openpyxl import Workbook, load_workbook
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from engine import get_catalog, summarize_company
+from engine import ciiu_for_code, get_catalog, summarize_company
 from workflow import (MergeConflict, assign_company, export_state, identity,
                       load_state, merge_states, reviewed_rows, update_review)
 
@@ -29,7 +29,7 @@ def input_excel():
 
 def changes(record, name, comment):
     updated = dict(record["review"])
-    updated.update({"decision": "Aceptado", "reviewer": name, "observations": comment})
+    updated.update({"decision": "Justificación", "reviewer": name, "observations": comment})
     return updated
 
 
@@ -44,6 +44,23 @@ class ExcelFlowTest(unittest.TestCase):
         self.assertEqual([code for code, _ in pairs["G463033"]], ["46306112"])
         self.assertEqual({code for code, _ in pairs["H521000"]},
                          {"52106721", "52106722", "52106729"})
+
+    def test_reverse_reference_distinguishes_exact_code_from_same_cpc(self):
+        exact = ciiu_for_code(self.catalog, "45208714")
+        self.assertTrue(exact)
+        self.assertTrue(all(code == "45208714" for _, _, code in exact))
+        self.assertTrue(any(activity == "G452001" for activity, _, _ in exact))
+        broad = ciiu_for_code(self.catalog, "45208714", include_same_cpc=True)
+        self.assertGreaterEqual(len(broad), len(exact))
+        self.assertTrue(all(code.endswith("8714") for _, _, code in broad))
+
+    def test_old_accepted_status_is_renamed_on_import(self):
+        wb = load_workbook(io.BytesIO(input_excel()))
+        wb["Servicios"]["K2"] = "Aceptado"
+        buffer = io.BytesIO()
+        wb.save(buffer)
+        self.assertEqual(load_state(buffer.getvalue())["rows"][0]["review"]["decision"],
+                         "Justificación")
 
     def test_roundtrip_preserves_assignments_decisions_and_values(self):
         state = load_state(input_excel())
